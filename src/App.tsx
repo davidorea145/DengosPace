@@ -148,13 +148,13 @@ export default function App() {
       navigator.geolocation.getCurrentPosition(
         () => setGpsAvailable(true),
         () => setGpsAvailable(false),
-        { enableHighAccuracy: true, timeout: 5000 }
+        { enableHighAccuracy: false, timeout: 10000, maximumAge: 10000 }
       );
 
       backgroundWatchId = navigator.geolocation.watchPosition(
         () => setGpsAvailable(true),
         () => setGpsAvailable(false),
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
       );
     };
 
@@ -300,18 +300,29 @@ export default function App() {
     // Explicitly request GPS if not granted
     try {
       await new Promise((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(resolve, reject, {
+        navigator.geolocation.getCurrentPosition(resolve, (err) => {
+          // Fallback to low accuracy if high accuracy fails
+          if (err.code === 3 || err.code === 2) {
+            navigator.geolocation.getCurrentPosition(resolve, reject, {
+              enableHighAccuracy: false,
+              timeout: 10000,
+              maximumAge: 10000
+            });
+          } else {
+            reject(err);
+          }
+        }, {
           enableHighAccuracy: true,
-          timeout: 8000,
-          maximumAge: 0
+          timeout: 15000,
+          maximumAge: 5000
         });
       });
     } catch (err: any) {
       console.error("Erro ao obter localização inicial:", err);
       let msg = "Permissão de GPS necessária para monitorar o ritmo.";
       if (err.code === 1) msg = "Acesso ao GPS foi negado pelo seu navegador.";
-      if (err.code === 2) msg = "Não foi possível obter sua localização (Sinal fraco).";
-      if (err.code === 3) msg = "Tempo esgotado ao tentar localizar seu GPS.";
+      if (err.code === 2) msg = "Não foi possível obter sua localização (Sinal fraco ou GPS desligado).";
+      if (err.code === 3) msg = "Tempo esgotado ao tentar localizar seu GPS. Tente ir para um local aberto.";
       setError(msg);
       return;
     }
@@ -471,12 +482,13 @@ export default function App() {
           if (err.code === 2) msg = "Sinal de GPS indisponível no momento.";
           if (err.code === 3) msg = "Tempo esgotado ao buscar sinal de GPS.";
           setError(msg);
-          stopTracking();
+          // Don't stop immediately on timeout during activity, try to recover
+          if (err.code !== 3) stopTracking();
         },
         {
           enableHighAccuracy: true,
-          maximumAge: 0,
-          timeout: 10000
+          maximumAge: 5000,
+          timeout: 20000
         }
       );
     } catch (globalErr: any) {
