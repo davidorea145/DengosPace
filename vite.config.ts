@@ -21,12 +21,12 @@ export default defineConfig(({mode}) => {
           display: 'standalone',
           icons: [
             {
-              src: 'https://picsum.photos/seed/dengospace/192/192',
+              src: 'https://images.unsplash.com/photo-1552674605-db6ffd4facb5?w=192&h=192&fit=crop&q=80',
               sizes: '192x192',
               type: 'image/png'
             },
             {
-              src: 'https://picsum.photos/seed/dengospace/512/512',
+              src: 'https://images.unsplash.com/photo-1552674605-db6ffd4facb5?w=512&h=512&fit=crop&q=80',
               sizes: '512x512',
               type: 'image/png'
             }

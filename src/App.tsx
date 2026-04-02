@@ -47,6 +47,7 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [isGracePeriod, setIsGracePeriod] = useState(false);
   const [useSound, setUseSound] = useState(true);
+  const [useVibration, setUseVibration] = useState(true);
   const [vibrationAuthorized, setVibrationAuthorized] = useState(false);
   const [currentSpeed, setCurrentSpeed] = useState<number | null>(null);
   const [stats, setStats] = useState<{
@@ -96,6 +97,12 @@ export default function App() {
   const smoothedSpeed = useRef<number | null>(null);
   const speedHistory = useRef<number[]>([]);
   const useDynamicPaceRef = useRef(false);
+
+  const useSoundRef = useRef(useSound);
+  const useVibrationRef = useRef(useVibration);
+
+  useEffect(() => { useSoundRef.current = useSound; }, [useSound]);
+  useEffect(() => { useVibrationRef.current = useVibration; }, [useVibration]);
 
   // Simple Exponential Moving Average for speed smoothing
   const updateSmoothedSpeed = (newSpeed: number | null, position?: GeolocationPosition) => {
@@ -505,10 +512,12 @@ export default function App() {
       const vibrateLoop = () => {
         if (!isVibratingRef.current) return;
         
-        if ('vibrate' in navigator) {
+        if (useVibrationRef.current && 'vibrate' in navigator) {
           navigator.vibrate([400, 200, 400]);
         }
-        playBeep();
+        if (useSoundRef.current) {
+          playBeep();
+        }
         
         vibrationInterval.current = window.setTimeout(vibrateLoop, 1500);
       };
@@ -725,14 +734,6 @@ export default function App() {
           <h1 className="text-xl font-bold tracking-tight">DengosPace</h1>
         </div>
         <div className="flex items-center gap-2">
-          <button 
-            onClick={() => setUseSound(!useSound)}
-            className={`px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-tighter transition-colors ${
-              useSound ? 'bg-emerald-500 text-black' : 'bg-neutral-800 text-neutral-500'
-            }`}
-          >
-            {useSound ? 'Som Ativo' : 'Som Mudo'}
-          </button>
           {permissions.notifications === 'granted' ? (
             <div className="w-2 h-2 rounded-full bg-emerald-500" title="Notificações Ativas" />
           ) : (
@@ -740,7 +741,7 @@ export default function App() {
           )}
           <button 
             onClick={() => setShowSettings(true)}
-            className="p-2 hover:bg-white/5 rounded-full transition-colors"
+            className="p-2 hover:bg-white/5 rounded-full transition-colors relative"
           >
             <Settings className="w-5 h-5 text-neutral-400" />
           </button>
@@ -1001,46 +1002,76 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="space-y-4">
-                <div className="flex justify-between items-center">
-                  <span className="text-sm font-bold text-neutral-400 uppercase tracking-widest">Filtro de Velocidade</span>
-                  <span className="text-emerald-500 font-black">{(smoothingFactor * 100).toFixed(0)}%</span>
-                </div>
-                <p className="text-[10px] text-neutral-500 leading-relaxed">
-                  Ajuste a suavidade da velocidade. 
-                  <br />
-                  <span className="text-emerald-500/50">Mais Rápido (100%)</span>: Reage instantaneamente, mas oscila mais.
-                  <br />
-                  <span className="text-blue-500/50">Mais Suave (1%)</span>: Muito estável, mas demora a reagir.
-                </p>
-                <input 
-                  type="range" 
-                  min="0.05" 
-                  max="1" 
-                  step="0.05" 
-                  value={smoothingFactor}
-                  onChange={(e) => setSmoothingFactor(parseFloat(e.target.value))}
-                  className="w-full accent-emerald-500"
-                />
-              </div>
-
-              <div className="space-y-4 pt-4 border-t border-white/5">
-                <div className="flex justify-between items-center">
-                  <div className="space-y-1">
-                    <span className="text-sm font-bold text-neutral-400 uppercase tracking-widest block">Ritmo Dinâmico</span>
-                    <p className="text-[10px] text-neutral-500 leading-relaxed max-w-[200px]">
-                      Ajusta sua meta em tempo real para compensar atrasos e atingir o pace médio final.
-                    </p>
-                  </div>
+              <div className="space-y-6">
+                {/* Alert Options */}
+                <div className="grid grid-cols-2 gap-3">
                   <button 
-                    onClick={() => setUseDynamicPace(!useDynamicPace)}
-                    className={`w-12 h-6 rounded-full transition-colors relative ${useDynamicPace ? 'bg-emerald-500' : 'bg-neutral-800'}`}
+                    onClick={() => setUseVibration(!useVibration)}
+                    className={`p-4 rounded-2xl border transition-all flex flex-col items-center gap-2 ${
+                      useVibration ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-500' : 'bg-neutral-800/50 border-white/5 text-neutral-500'
+                    }`}
                   >
-                    <motion.div 
-                      animate={{ x: useDynamicPace ? 24 : 4 }}
-                      className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
-                    />
+                    <Vibrate className="w-5 h-5" />
+                    <span className="text-[10px] font-black uppercase tracking-widest">Vibração</span>
                   </button>
+                  <button 
+                    onClick={() => setUseSound(!useSound)}
+                    className={`p-4 rounded-2xl border transition-all flex flex-col items-center gap-2 ${
+                      useSound ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-500' : 'bg-neutral-800/50 border-white/5 text-neutral-500'
+                    }`}
+                  >
+                    <Activity className="w-5 h-5" />
+                    <span className="text-[10px] font-black uppercase tracking-widest">Som</span>
+                  </button>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center">
+                    <span className="text-sm font-bold text-neutral-400 uppercase tracking-widest">Filtro de Velocidade</span>
+                    <span className="text-emerald-500 font-black">{(smoothingFactor * 100).toFixed(0)}%</span>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 leading-relaxed">
+                    Ajuste a suavidade da velocidade. 
+                    <br />
+                    <span className="text-emerald-500/50">Mais Rápido (100%)</span>: Reage instantaneamente, mas oscila mais.
+                    <br />
+                    <span className="text-blue-500/50">Mais Suave (1%)</span>: Muito estável, mas demora a reagir.
+                  </p>
+                  <input 
+                    type="range" 
+                    min="0.05" 
+                    max="1" 
+                    step="0.05" 
+                    value={smoothingFactor}
+                    onChange={(e) => setSmoothingFactor(parseFloat(e.target.value))}
+                    className="w-full accent-emerald-500"
+                  />
+                </div>
+
+                <div className="space-y-4 pt-4 border-t border-white/5">
+                  <div className="flex justify-between items-center">
+                    <div className="space-y-1">
+                      <span className="text-sm font-bold text-neutral-400 uppercase tracking-widest block">Ritmo Dinâmico</span>
+                      <p className="text-[10px] text-neutral-500 leading-relaxed max-w-[200px]">
+                        Ajusta sua meta em tempo real para compensar atrasos e atingir o pace médio final.
+                      </p>
+                    </div>
+                    <button 
+                      onClick={() => setUseDynamicPace(!useDynamicPace)}
+                      className={`w-12 h-6 rounded-full transition-colors relative ${useDynamicPace ? 'bg-emerald-500' : 'bg-neutral-800'}`}
+                    >
+                      <motion.div 
+                        animate={{ x: useDynamicPace ? 24 : 4 }}
+                        className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="pt-4 text-center">
+                  <span className="text-[8px] font-bold text-neutral-700 uppercase tracking-[0.3em]">
+                    DengosPace v1.2.0
+                  </span>
                 </div>
               </div>
 
