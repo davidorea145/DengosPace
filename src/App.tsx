@@ -68,6 +68,7 @@ export default function App() {
     notifications: 'unknown'
   });
   const [gpsAvailable, setGpsAvailable] = useState(false);
+  const [isCheckingGps, setIsCheckingGps] = useState(false);
   const [isCompensating, setIsCompensating] = useState(false);
   const [adjustedTargetPace, setAdjustedTargetPace] = useState<{min: number, sec: number} | null>(null);
   
@@ -137,6 +138,36 @@ export default function App() {
   useEffect(() => {
     targetSpeedRef.current = targetSpeed;
   }, [targetSpeed]);
+
+  // Manual GPS Check
+  const checkGpsManually = async () => {
+    if (isCheckingGps) return;
+    setIsCheckingGps(true);
+    setError(null);
+    try {
+      await new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            setGpsAvailable(true);
+            resolve(pos);
+          },
+          (err) => {
+            setGpsAvailable(false);
+            reject(err);
+          },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+      });
+    } catch (err: any) {
+      console.error("Manual GPS check failed:", err);
+      let msg = "Não foi possível encontrar o sinal de GPS.";
+      if (err.code === 1) msg = "Permissão de GPS negada.";
+      if (err.code === 3) msg = "Tempo esgotado. Tente ir para um local aberto.";
+      setError(msg);
+    } finally {
+      setIsCheckingGps(false);
+    }
+  };
 
   // Check permissions and start background GPS check
   useEffect(() => {
@@ -317,6 +348,7 @@ export default function App() {
           maximumAge: 5000
         });
       });
+      setGpsAvailable(true);
     } catch (err: any) {
       console.error("Erro ao obter localização inicial:", err);
       let msg = "Permissão de GPS necessária para monitorar o ritmo.";
@@ -614,12 +646,16 @@ export default function App() {
                 <Timer className="w-4 h-4" />
                 <span>Ritmo Alvo (min/km)</span>
               </div>
-              <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${gpsAvailable ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+              <button 
+                onClick={checkGpsManually}
+                disabled={isCheckingGps}
+                className="flex items-center gap-2 hover:bg-white/5 px-2 py-1 rounded-lg transition-colors active:scale-95 disabled:opacity-50"
+              >
+                <div className={`w-2 h-2 rounded-full ${isCheckingGps ? 'bg-blue-500 animate-ping' : gpsAvailable ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
                 <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">
-                  {gpsAvailable ? 'GPS Pronto' : 'Buscando GPS'}
+                  {isCheckingGps ? 'Verificando...' : gpsAvailable ? 'GPS Pronto' : 'Buscando GPS (Toque p/ Forçar)'}
                 </span>
-              </div>
+              </button>
             </div>
             
             <div className="bg-neutral-900/50 border border-white/10 rounded-3xl p-8 flex flex-col items-center justify-center gap-4">
@@ -830,10 +866,21 @@ export default function App() {
           <motion.div 
             initial={{ opacity: 0, scale: 0.9 }}
             animate={{ opacity: 1, scale: 1 }}
-            className="bg-red-500/20 border border-red-500/50 rounded-2xl p-4 flex gap-3 text-red-200 text-sm"
+            className="bg-red-500/20 border border-red-500/50 rounded-2xl p-4 flex flex-col gap-3 text-red-200 text-sm"
           >
-            <AlertTriangle className="w-5 h-5 shrink-0" />
-            <p>{error}</p>
+            <div className="flex gap-3">
+              <AlertTriangle className="w-5 h-5 shrink-0" />
+              <p>{error}</p>
+            </div>
+            {error.includes("GPS") && (
+              <button 
+                onClick={checkGpsManually}
+                disabled={isCheckingGps}
+                className="bg-red-500/30 hover:bg-red-500/50 py-2 rounded-xl font-bold uppercase tracking-widest text-[10px] transition-colors disabled:opacity-50"
+              >
+                {isCheckingGps ? 'Verificando...' : 'Tentar Novamente'}
+              </button>
+            )}
           </motion.div>
         )}
 
