@@ -300,11 +300,19 @@ export default function App() {
     // Explicitly request GPS if not granted
     try {
       await new Promise((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(resolve, reject);
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 8000,
+          maximumAge: 0
+        });
       });
-    } catch (err) {
+    } catch (err: any) {
       console.error("Erro ao obter localização inicial:", err);
-      setError("Permissão de GPS necessária para monitorar o ritmo.");
+      let msg = "Permissão de GPS necessária para monitorar o ritmo.";
+      if (err.code === 1) msg = "Acesso ao GPS foi negado pelo seu navegador.";
+      if (err.code === 2) msg = "Não foi possível obter sua localização (Sinal fraco).";
+      if (err.code === 3) msg = "Tempo esgotado ao tentar localizar seu GPS.";
+      setError(msg);
       return;
     }
 
@@ -316,7 +324,8 @@ export default function App() {
       setCountdown(prev => {
         if (prev === null || prev <= 1) {
           clearInterval(countdownInterval);
-          initTracking();
+          // Call initTracking outside of the state updater
+          setTimeout(() => initTracking(), 0);
           return null;
         }
         return prev - 1;
@@ -324,124 +333,157 @@ export default function App() {
     }, 1000);
   };
 
-  const initTracking = () => {
-    setIsRunning(true);
-    isRunningRef.current = true;
-    setIsGracePeriod(true);
-    isGracePeriodRef.current = true;
-    setStats(null);
-    
-    // Reset stats
-    startTime.current = Date.now();
-    totalDistance.current = 0;
-    lastPosition.current = null;
-    smoothedSpeed.current = null;
-    
-    requestWakeLock();
-
-    // 5s Grace period for acceleration
-    setTimeout(() => {
-      setIsGracePeriod(false);
-      isGracePeriodRef.current = false;
-    }, 5000);
-
-    // Send start notification
-    if (Notification.permission === 'granted') {
-      new Notification("DengosPace", {
-        body: "Monitoramento iniciado. Mantenha o ritmo!",
-        icon: "/favicon.ico",
-        silent: true
-      });
-    }
-
-    watchId.current = navigator.geolocation.watchPosition(
-      (position) => {
-        setGpsAvailable(true);
-        // Guard: check if we are still supposed to be running
-        if (!isRunningRef.current) return;
-
-        const rawSpeed = position.coords.speed; // speed in m/s
-        const speed = updateSmoothedSpeed(rawSpeed);
-        setCurrentSpeed(speed);
-
-        // Update distance
-        if (lastPosition.current) {
-          const dist = calculateDistance(
-            lastPosition.current.latitude,
-            lastPosition.current.longitude,
-            position.coords.latitude,
-            position.coords.longitude
-          );
-          // Filter out GPS jumps (e.g. > 30m in 1s is likely error)
-          // Also ignore very small movements to avoid drift
-          if (dist < 30 && dist > 0.5) {
-            totalDistance.current += dist;
-          }
-        }
-        lastPosition.current = position.coords;
-
-        if (speed !== null && !isGracePeriodRef.current) {
-          let effectiveTargetSpeed = targetSpeedRef.current;
-          let compensating = false;
-
-          // Dynamic Pace Logic
-          if (useDynamicPaceRef.current && startTime.current) {
-            const elapsedSec = (Date.now() - startTime.current) / 1000;
-            if (elapsedSec > 15) { // Wait for more data for stability
-              const avgSpeedSoFar = totalDistance.current / elapsedSec;
-              if (avgSpeedSoFar > 0.2 && avgSpeedSoFar < targetSpeedRef.current) {
-                // If average is below target, we need to run faster to compensate
-                const adjustment = targetSpeedRef.current - avgSpeedSoFar;
-                effectiveTargetSpeed = targetSpeedRef.current + adjustment;
-                // Cap the adjustment to 25% faster to avoid impossible targets
-                effectiveTargetSpeed = Math.min(effectiveTargetSpeed, targetSpeedRef.current * 1.25);
-                compensating = true;
-                setAdjustedTargetPace(speedToPace(effectiveTargetSpeed));
-              } else {
-                setAdjustedTargetPace(null);
-              }
-            }
-          } else {
-            setAdjustedTargetPace(null);
-          }
-          
-          setIsCompensating(compensating);
-
-          if (speed < effectiveTargetSpeed) {
-            // Notify if below target
-            if (Notification.permission === 'granted' && !isVibratingRef.current) {
-              new Notification("DengosPace", {
-                body: compensating ? "Compense o ritmo! Acelere!" : "Você está abaixo do ritmo! Acelere!",
-                silent: true,
-                tag: 'pace-alert',
-                renotify: true
-              } as any);
-            }
-            startVibration();
-          } else {
-            if (isVibratingRef.current && Notification.permission === 'granted') {
-              new Notification("DengosPace", {
-                body: "Ritmo recuperado!",
-                silent: true,
-                tag: 'pace-alert',
-                renotify: true
-              } as any);
-            }
-            stopVibration();
-          }
-        }
-      },
-      (err) => {
-        console.error(err);
-        setError("Erro ao acessar GPS. Verifique as permissões.");
-        stopTracking();
-      },
-      {
-        enableHighAccuracy: true,
-        maximumAge: 0,
-        timeout: 5000
+  const initTracking = async () => {
+    try {
+      setIsRunning(true);
+      isRunningRef.current = true;
+      setIsGracePeriod(true);
+      isGracePeriodRef.current = true;
+      setStats(null);
+      setError(null);
+      
+      // Reset stats
+      startTime.current = Date.now();
+      totalDistance.current = 0;
+      lastPosition.current = null;
+      smoothedSpeed.current = null;
+      
+      // Wake Lock
+      try {
+        await requestWakeLock();
+      } catch (wlErr) {
+        console.warn("Wake Lock falhou (o app pode suspender se a tela apagar):", wlErr);
+        // Don't block the whole app for wake lock, but log it
       }
-    );
+
+      // 5s Grace period for acceleration
+      setTimeout(() => {
+        setIsGracePeriod(false);
+        isGracePeriodRef.current = false;
+      }, 5000);
+
+      // Send start notification
+      try {
+        if (Notification.permission === 'granted') {
+          new Notification("DengosPace", {
+            body: "Monitoramento iniciado. Mantenha o ritmo!",
+            icon: "/favicon.ico",
+            silent: true
+          });
+        }
+      } catch (nErr) {
+        console.error("Erro ao enviar notificação de início:", nErr);
+      }
+
+      if (!navigator.geolocation) {
+        throw new Error("Seu dispositivo não suporta GPS.");
+      }
+
+      watchId.current = navigator.geolocation.watchPosition(
+        (position) => {
+          setGpsAvailable(true);
+          // Guard: check if we are still supposed to be running
+          if (!isRunningRef.current) return;
+
+          const rawSpeed = position.coords.speed; // speed in m/s
+          const speed = updateSmoothedSpeed(rawSpeed);
+          setCurrentSpeed(speed);
+
+          // Update distance
+          if (lastPosition.current) {
+            const dist = calculateDistance(
+              lastPosition.current.latitude,
+              lastPosition.current.longitude,
+              position.coords.latitude,
+              position.coords.longitude
+            );
+            // Filter out GPS jumps (e.g. > 30m in 1s is likely error)
+            // Also ignore very small movements to avoid drift
+            if (dist < 30 && dist > 0.5) {
+              totalDistance.current += dist;
+            }
+          }
+          lastPosition.current = position.coords;
+
+          if (speed !== null && !isGracePeriodRef.current) {
+            let effectiveTargetSpeed = targetSpeedRef.current;
+            let compensating = false;
+
+            // Dynamic Pace Logic
+            if (useDynamicPaceRef.current && startTime.current) {
+              const elapsedSec = (Date.now() - startTime.current) / 1000;
+              if (elapsedSec > 15) { // Wait for more data for stability
+                const avgSpeedSoFar = totalDistance.current / elapsedSec;
+                if (avgSpeedSoFar > 0.2 && avgSpeedSoFar < targetSpeedRef.current) {
+                  // If average is below target, we need to run faster to compensate
+                  const adjustment = targetSpeedRef.current - avgSpeedSoFar;
+                  effectiveTargetSpeed = targetSpeedRef.current + adjustment;
+                  // Cap the adjustment to 25% faster to avoid impossible targets
+                  effectiveTargetSpeed = Math.min(effectiveTargetSpeed, targetSpeedRef.current * 1.25);
+                  compensating = true;
+                  setAdjustedTargetPace(speedToPace(effectiveTargetSpeed));
+                } else {
+                  setAdjustedTargetPace(null);
+                }
+              }
+            } else {
+              setAdjustedTargetPace(null);
+            }
+            
+            setIsCompensating(compensating);
+
+            if (speed < effectiveTargetSpeed) {
+              // Notify if below target
+              if (Notification.permission === 'granted' && !isVibratingRef.current) {
+                try {
+                  new Notification("DengosPace", {
+                    body: compensating ? "Compense o ritmo! Acelere!" : "Você está abaixo do ritmo! Acelere!",
+                    silent: true,
+                    tag: 'pace-alert',
+                    renotify: true
+                  } as any);
+                } catch (e) {
+                  console.error("Erro na notificação de alerta:", e);
+                }
+              }
+              startVibration();
+            } else {
+              if (isVibratingRef.current && Notification.permission === 'granted') {
+                try {
+                  new Notification("DengosPace", {
+                    body: "Ritmo recuperado!",
+                    silent: true,
+                    tag: 'pace-alert',
+                    renotify: true
+                  } as any);
+                } catch (e) {
+                  console.error("Erro na notificação de recuperação:", e);
+                }
+              }
+              stopVibration();
+            }
+          }
+        },
+        (err) => {
+          console.error("Erro no watchPosition:", err);
+          let msg = "Erro ao acessar GPS.";
+          if (err.code === 1) msg = "Permissão de GPS negada pelo sistema.";
+          if (err.code === 2) msg = "Sinal de GPS indisponível no momento.";
+          if (err.code === 3) msg = "Tempo esgotado ao buscar sinal de GPS.";
+          setError(msg);
+          stopTracking();
+        },
+        {
+          enableHighAccuracy: true,
+          maximumAge: 0,
+          timeout: 10000
+        }
+      );
+    } catch (globalErr: any) {
+      console.error("Erro crítico ao iniciar treino:", globalErr);
+      setError(`Erro ao iniciar: ${globalErr.message || "Erro desconhecido"}`);
+      stopTracking();
+    }
   };
 
   // Stop Tracking
