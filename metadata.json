@@ -1,0 +1,5 @@
+{
+  "name": "DengosPace",
+  "description": "Treinador silencioso que usa vibração para manter seu ritmo de corrida.",
+  "requestFramePermissions": ["geolocation"]
+}
