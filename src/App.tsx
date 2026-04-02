@@ -58,6 +58,7 @@ export default function App() {
   const [isVibrating, setIsVibrating] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [smoothingFactor, setSmoothingFactor] = useState(0.4);
+  const [useDynamicPace, setUseDynamicPace] = useState(false);
   const [wakeLock, setWakeLock] = useState<WakeLockSentinel | null>(null);
   const [permissions, setPermissions] = useState<{
     location: PermissionState | 'unknown';
@@ -66,6 +67,9 @@ export default function App() {
     location: 'unknown',
     notifications: 'unknown'
   });
+  const [gpsAvailable, setGpsAvailable] = useState(false);
+  const [isCompensating, setIsCompensating] = useState(false);
+  const [adjustedTargetPace, setAdjustedTargetPace] = useState<{min: number, sec: number} | null>(null);
   
   // Refs for tracking and state sync in callbacks
   const isRunningRef = useRef(false);
@@ -82,6 +86,7 @@ export default function App() {
   const lastPosition = useRef<GeolocationCoordinates | null>(null);
   const smoothedSpeed = useRef<number | null>(null);
   const speedHistory = useRef<number[]>([]);
+  const useDynamicPaceRef = useRef(false);
 
   // Simple Exponential Moving Average for speed smoothing
   const updateSmoothedSpeed = (newSpeed: number | null) => {
@@ -123,29 +128,72 @@ export default function App() {
     isVibratingRef.current = isVibrating;
   }, [isVibrating]);
 
+  useEffect(() => {
+    useDynamicPaceRef.current = useDynamicPace;
+  }, [useDynamicPace]);
+
   // Target speed in m/s
   const targetSpeed = paceToSpeed(minInput, secInput);
   useEffect(() => {
     targetSpeedRef.current = targetSpeed;
   }, [targetSpeed]);
 
-  // Check permissions on mount
+  // Check permissions and start background GPS check
   useEffect(() => {
+    let backgroundWatchId: number | null = null;
+
+    const startBackgroundGps = () => {
+      if (backgroundWatchId !== null) return;
+      // Try a single get first to wake up GPS
+      navigator.geolocation.getCurrentPosition(
+        () => setGpsAvailable(true),
+        () => setGpsAvailable(false),
+        { enableHighAccuracy: true, timeout: 5000 }
+      );
+
+      backgroundWatchId = navigator.geolocation.watchPosition(
+        () => setGpsAvailable(true),
+        () => setGpsAvailable(false),
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
+    };
+
     if ('permissions' in navigator) {
-      try {
-        navigator.permissions.query({ name: 'geolocation' as PermissionName }).then(status => {
+      navigator.permissions.query({ name: 'geolocation' as PermissionName }).then(status => {
+        setPermissions(prev => ({ ...prev, location: status.state }));
+        
+        if (status.state === 'granted' && !isRunning) {
+          startBackgroundGps();
+        }
+
+        status.onchange = () => {
           setPermissions(prev => ({ ...prev, location: status.state }));
-          status.onchange = () => setPermissions(prev => ({ ...prev, location: status.state }));
-        }).catch(err => console.error("Erro ao consultar permissão de GPS:", err));
-      } catch (err) {
-        console.error("Navegador não suporta consulta de permissão de GPS:", err);
-      }
+          if (status.state === 'granted' && !isRunning) {
+            startBackgroundGps();
+          } else if (status.state !== 'granted') {
+            if (backgroundWatchId !== null) {
+              navigator.geolocation.clearWatch(backgroundWatchId);
+              backgroundWatchId = null;
+            }
+            setGpsAvailable(false);
+          }
+        };
+      });
+    } else {
+      // Fallback for browsers without permissions API
+      if (!isRunning) startBackgroundGps();
     }
     
     if ('Notification' in window) {
       setPermissions(prev => ({ ...prev, notifications: Notification.permission }));
     }
-  }, []);
+
+    return () => {
+      if (backgroundWatchId !== null) {
+        navigator.geolocation.clearWatch(backgroundWatchId);
+      }
+    };
+  }, [isRunning]);
 
   // Request Wake Lock to keep screen on
   const requestWakeLock = async () => {
@@ -308,6 +356,7 @@ export default function App() {
 
     watchId.current = navigator.geolocation.watchPosition(
       (position) => {
+        setGpsAvailable(true);
         // Guard: check if we are still supposed to be running
         if (!isRunningRef.current) return;
 
@@ -324,18 +373,45 @@ export default function App() {
             position.coords.longitude
           );
           // Filter out GPS jumps (e.g. > 30m in 1s is likely error)
-          if (dist < 30) {
+          // Also ignore very small movements to avoid drift
+          if (dist < 30 && dist > 0.5) {
             totalDistance.current += dist;
           }
         }
         lastPosition.current = position.coords;
 
         if (speed !== null && !isGracePeriodRef.current) {
-          if (speed < targetSpeedRef.current) {
+          let effectiveTargetSpeed = targetSpeedRef.current;
+          let compensating = false;
+
+          // Dynamic Pace Logic
+          if (useDynamicPaceRef.current && startTime.current) {
+            const elapsedSec = (Date.now() - startTime.current) / 1000;
+            if (elapsedSec > 15) { // Wait for more data for stability
+              const avgSpeedSoFar = totalDistance.current / elapsedSec;
+              if (avgSpeedSoFar > 0.2 && avgSpeedSoFar < targetSpeedRef.current) {
+                // If average is below target, we need to run faster to compensate
+                const adjustment = targetSpeedRef.current - avgSpeedSoFar;
+                effectiveTargetSpeed = targetSpeedRef.current + adjustment;
+                // Cap the adjustment to 25% faster to avoid impossible targets
+                effectiveTargetSpeed = Math.min(effectiveTargetSpeed, targetSpeedRef.current * 1.25);
+                compensating = true;
+                setAdjustedTargetPace(speedToPace(effectiveTargetSpeed));
+              } else {
+                setAdjustedTargetPace(null);
+              }
+            }
+          } else {
+            setAdjustedTargetPace(null);
+          }
+          
+          setIsCompensating(compensating);
+
+          if (speed < effectiveTargetSpeed) {
             // Notify if below target
             if (Notification.permission === 'granted' && !isVibratingRef.current) {
               new Notification("DengosPace", {
-                body: "Você está abaixo do ritmo! Acelere!",
+                body: compensating ? "Compense o ritmo! Acelere!" : "Você está abaixo do ritmo! Acelere!",
                 silent: true,
                 tag: 'pace-alert',
                 renotify: true
@@ -376,9 +452,9 @@ export default function App() {
     const distanceKm = totalDistance.current / 1000;
     
     // Calculate average pace
-    let avgPaceStr = "0:00";
-    if (distanceKm > 0.05) { // Only if moved more than 50m
-      const totalMin = (durationMs / 1000) / 60;
+    let avgPaceStr = "--:--";
+    if (distanceKm > 0.01) { // Only if moved more than 10m
+      const totalMin = durationSec / 60;
       const paceDecimal = totalMin / distanceKm;
       const pMin = Math.floor(paceDecimal);
       const pSec = Math.round((paceDecimal - pMin) * 60);
@@ -398,6 +474,8 @@ export default function App() {
     isGracePeriodRef.current = false;
     setCountdown(null);
     setCurrentSpeed(null);
+    setIsCompensating(false);
+    setAdjustedTargetPace(null);
     stopVibration();
     releaseWakeLock();
 
@@ -477,9 +555,17 @@ export default function App() {
         {/* Pace Input Section - Hidden when running */}
         {!isRunning && countdown === null && (
           <section className="space-y-4">
-            <div className="flex items-center gap-2 text-neutral-400 text-sm font-medium uppercase tracking-wider">
-              <Timer className="w-4 h-4" />
-              <span>Ritmo Alvo (min/km)</span>
+            <div className="flex justify-between items-center">
+              <div className="flex items-center gap-2 text-neutral-400 text-sm font-medium uppercase tracking-wider">
+                <Timer className="w-4 h-4" />
+                <span>Ritmo Alvo (min/km)</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className={`w-2 h-2 rounded-full ${gpsAvailable ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+                <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">
+                  {gpsAvailable ? 'GPS Pronto' : 'Buscando GPS'}
+                </span>
+              </div>
             </div>
             
             <div className="bg-neutral-900/50 border border-white/10 rounded-3xl p-8 flex flex-col items-center justify-center gap-4">
@@ -550,7 +636,11 @@ export default function App() {
                   <div className="flex items-center gap-4 text-neutral-400 font-medium">
                     <span>Ritmo Atual</span>
                     <span className="text-neutral-600">|</span>
-                    <span className="text-emerald-500/80">Meta: {formatPace(minInput, secInput)}</span>
+                    <span className={isCompensating ? "text-blue-400" : "text-emerald-500/80"}>
+                      {isCompensating && adjustedTargetPace 
+                        ? `Meta Ajustada: ${formatPace(adjustedTargetPace.min, adjustedTargetPace.sec)}`
+                        : `Meta: ${formatPace(minInput, secInput)}`}
+                    </span>
                   </div>
                 </div>
 
@@ -759,6 +849,26 @@ export default function App() {
                   onChange={(e) => setSmoothingFactor(parseFloat(e.target.value))}
                   className="w-full accent-emerald-500"
                 />
+              </div>
+
+              <div className="space-y-4 pt-4 border-t border-white/5">
+                <div className="flex justify-between items-center">
+                  <div className="space-y-1">
+                    <span className="text-sm font-bold text-neutral-400 uppercase tracking-widest block">Ritmo Dinâmico</span>
+                    <p className="text-[10px] text-neutral-500 leading-relaxed max-w-[200px]">
+                      Ajusta sua meta em tempo real para compensar atrasos e atingir o pace médio final.
+                    </p>
+                  </div>
+                  <button 
+                    onClick={() => setUseDynamicPace(!useDynamicPace)}
+                    className={`w-12 h-6 rounded-full transition-colors relative ${useDynamicPace ? 'bg-emerald-500' : 'bg-neutral-800'}`}
+                  >
+                    <motion.div 
+                      animate={{ x: useDynamicPace ? 24 : 4 }}
+                      className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+                    />
+                  </button>
+                </div>
               </div>
 
               <button 
