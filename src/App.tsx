@@ -45,9 +45,9 @@ export default function App() {
   const [minInput, setMinInput] = useState<number>(5);
   const [secInput, setSecInput] = useState<number>(0);
   const [isRunning, setIsRunning] = useState(false);
-  const [countdown, setCountdown] = useState<number | null>(null);
   const [isGracePeriod, setIsGracePeriod] = useState(false);
   const [useSound, setUseSound] = useState(true);
+  const [vibrationAuthorized, setVibrationAuthorized] = useState(false);
   const [currentSpeed, setCurrentSpeed] = useState<number | null>(null);
   const [stats, setStats] = useState<{
     distance: number;
@@ -69,11 +69,16 @@ export default function App() {
   });
   const [gpsAvailable, setGpsAvailable] = useState(false);
   const [isCheckingGps, setIsCheckingGps] = useState(false);
+  const [isVerifyingGps, setIsVerifyingGps] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const [countdown, setCountdown] = useState<number | null>(null);
   const [isCompensating, setIsCompensating] = useState(false);
   const [adjustedTargetPace, setAdjustedTargetPace] = useState<{min: number, sec: number} | null>(null);
+  const [duration, setDuration] = useState(0);
   
+  const lastUpdateTimestamp = useRef<number>(Date.now());
+
   // Refs for tracking and state sync in callbacks
-  const backgroundWatchIdRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
   const isGracePeriodRef = useRef(false);
   const isVibratingRef = useRef(false);
@@ -81,6 +86,8 @@ export default function App() {
   const watchId = useRef<number | null>(null);
   const vibrationInterval = useRef<number | null>(null);
   const audioContext = useRef<AudioContext | null>(null);
+  const timerInterval = useRef<number | null>(null);
+  const countdownInterval = useRef<number | null>(null);
   
   // Stats tracking refs
   const startTime = useRef<number | null>(null);
@@ -91,15 +98,54 @@ export default function App() {
   const useDynamicPaceRef = useRef(false);
 
   // Simple Exponential Moving Average for speed smoothing
-  const updateSmoothedSpeed = (newSpeed: number | null) => {
-    if (newSpeed === null) return null;
+  const updateSmoothedSpeed = (newSpeed: number | null, position?: GeolocationPosition) => {
+    let speedToUse = newSpeed;
+
+    // Fallback: Calculate speed from distance if raw speed is null or unreliable
+    if ((speedToUse === null || speedToUse === 0) && position && lastPosition.current) {
+      const lastPos = lastPosition.current as any;
+      const timeDelta = (position.timestamp - lastPos.timestamp) / 1000;
+      
+      // Only use fallback if we have a reasonable time gap (0.5s to 5s)
+      if (timeDelta > 0.5 && timeDelta < 5) {
+        const dist = calculateDistance(
+          lastPosition.current.latitude,
+          lastPosition.current.longitude,
+          position.coords.latitude,
+          position.coords.longitude
+        );
+        
+        // Filter out GPS jumps (e.g. > 30m in 1s is likely error)
+        // Also ignore very small movements to avoid drift
+        if (dist > 0.5 && dist < 30) {
+          speedToUse = dist / timeDelta;
+          console.log("Calculated speed fallback:", speedToUse.toFixed(2), "m/s (dist:", dist.toFixed(2), "m, time:", timeDelta.toFixed(2), "s)");
+        }
+      }
+    }
+
+    if (speedToUse === null) return smoothedSpeed.current;
+    
     if (smoothedSpeed.current === null) {
-      smoothedSpeed.current = newSpeed;
+      smoothedSpeed.current = speedToUse;
     } else {
-      smoothedSpeed.current = (smoothingFactor * newSpeed) + ((1 - smoothingFactor) * smoothedSpeed.current);
+      smoothedSpeed.current = (smoothingFactor * speedToUse) + ((1 - smoothingFactor) * smoothedSpeed.current);
     }
     return smoothedSpeed.current;
   };
+
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   // Haversine distance calculation
   const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
@@ -119,24 +165,29 @@ export default function App() {
 
   // Sync refs with state
   useEffect(() => {
+    console.log("Is Running state changed:", isRunning);
     isRunningRef.current = isRunning;
   }, [isRunning]);
 
   useEffect(() => {
+    console.log("Grace period active:", isGracePeriod);
     isGracePeriodRef.current = isGracePeriod;
   }, [isGracePeriod]);
 
   useEffect(() => {
+    console.log("Vibration active:", isVibrating);
     isVibratingRef.current = isVibrating;
   }, [isVibrating]);
 
   useEffect(() => {
+    console.log("Dynamic Pace enabled:", useDynamicPace);
     useDynamicPaceRef.current = useDynamicPace;
   }, [useDynamicPace]);
 
   // Target speed in m/s
   const targetSpeed = paceToSpeed(minInput, secInput);
   useEffect(() => {
+    console.log("Target speed updated to:", targetSpeed.toFixed(2), "m/s");
     targetSpeedRef.current = targetSpeed;
   }, [targetSpeed]);
 
@@ -151,10 +202,6 @@ export default function App() {
       if (watchId.current !== null) {
         navigator.geolocation.clearWatch(watchId.current);
         watchId.current = null;
-      }
-      if (backgroundWatchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(backgroundWatchIdRef.current);
-        backgroundWatchIdRef.current = null;
       }
 
       // 2. Try High Accuracy first
@@ -184,17 +231,8 @@ export default function App() {
 
       setGpsAvailable(true);
 
-      // 4. Restart the appropriate watch
-      if (isRunningRef.current) {
-        startWatchPosition();
-      } else {
-        // Re-trigger background watch via effect or manually
-        // For simplicity, we'll let the effect handle it if we just clear the ref
-        // but since we want it NOW, let's call the start function if we had one
-        // Actually, the effect will re-run if we change a dependency, 
-        // but here we can just manually restart it.
-        startBackgroundGpsInternal();
-      }
+      // 4. Restart the watch
+      startWatchPosition();
     } catch (err: any) {
       console.error("Manual GPS check failed:", err);
       let msg = "Não foi possível encontrar o sinal de GPS.";
@@ -208,28 +246,43 @@ export default function App() {
     }
   };
 
-  const startBackgroundGpsInternal = () => {
-    if (backgroundWatchIdRef.current !== null || isRunningRef.current) return;
-    
-    backgroundWatchIdRef.current = navigator.geolocation.watchPosition(
-      () => setGpsAvailable(true),
-      () => setGpsAvailable(false),
-      { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
-    );
-  };
-
-  const startWatchPosition = () => {
+  const startWatchPosition = async () => {
     if (watchId.current !== null) return;
+
+    console.log("Starting GPS Watch Position...");
+    lastUpdateTimestamp.current = Date.now();
+
+    // Kickstart sensor to ensure it's active
+    try {
+      await new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, { 
+          enableHighAccuracy: true, 
+          timeout: 5000, 
+          maximumAge: 0 
+        });
+      });
+      console.log("GPS Kickstart success");
+      setGpsAvailable(true);
+    } catch (e) {
+      console.warn("GPS Kickstart failed, proceeding to watchPosition anyway", e);
+    }
 
     watchId.current = navigator.geolocation.watchPosition(
       (position) => {
+        lastUpdateTimestamp.current = Date.now();
         setGpsAvailable(true);
-        // Guard: check if we are still supposed to be running
-        if (!isRunningRef.current) return;
-
+        
         const rawSpeed = position.coords.speed; // speed in m/s
-        const speed = updateSmoothedSpeed(rawSpeed);
+        const speed = updateSmoothedSpeed(rawSpeed, position);
         setCurrentSpeed(speed);
+
+        // Guard: check if we are still supposed to be running
+        if (!isRunningRef.current) {
+          // Even if not running, we keep track of last position for smooth start
+          lastPosition.current = position.coords;
+          (position.coords as any).timestamp = position.timestamp;
+          return;
+        }
 
         // Update distance
         if (lastPosition.current) {
@@ -239,12 +292,16 @@ export default function App() {
             position.coords.latitude,
             position.coords.longitude
           );
+          
           // Filter out GPS jumps (e.g. > 30m in 1s is likely error)
           // Also ignore very small movements to avoid drift
           if (dist < 30 && dist > 0.5) {
             totalDistance.current += dist;
           }
         }
+        
+        // Store position with timestamp for speed calculation fallback
+        (position.coords as any).timestamp = position.timestamp;
         lastPosition.current = position.coords;
 
         if (speed !== null && !isGracePeriodRef.current) {
@@ -274,7 +331,12 @@ export default function App() {
           
           setIsCompensating(compensating);
 
-          if (speed < effectiveTargetSpeed) {
+          // Hysteresis to avoid rapid vibration switching
+          const threshold = 0.05; // 0.05 m/s (~0.18 km/h)
+          
+          console.log(`Comparação: Atual ${speed.toFixed(2)} m/s vs Meta ${effectiveTargetSpeed.toFixed(2)} m/s`);
+
+          if (speed < effectiveTargetSpeed - threshold) {
             // Notify if below target
             if (Notification.permission === 'granted' && !isVibratingRef.current) {
               try {
@@ -289,7 +351,7 @@ export default function App() {
               }
             }
             startVibration();
-          } else {
+          } else if (speed > effectiveTargetSpeed + threshold) {
             if (isVibratingRef.current && Notification.permission === 'granted') {
               try {
                 new Notification("DengosPace", {
@@ -308,60 +370,41 @@ export default function App() {
       },
       (err) => {
         console.error("Erro no watchPosition:", err);
+        setGpsAvailable(false);
         let msg = "Erro ao acessar GPS.";
         if (err.code === 1) msg = "Permissão de GPS negada pelo sistema.";
         if (err.code === 2) msg = "Sinal de GPS indisponível no momento.";
         if (err.code === 3) msg = "Tempo esgotado ao buscar sinal de GPS.";
         setError(msg);
         // Don't stop immediately on timeout during activity, try to recover
-        if (err.code !== 3) stopTracking();
+        if (err.code === 1 && isRunningRef.current) stopTracking();
       },
       {
         enableHighAccuracy: true,
-        maximumAge: 5000,
+        maximumAge: 0,
         timeout: 20000
       }
     );
   };
 
-  // Check permissions and start background GPS check
+  // Check permissions and start GPS watch
   useEffect(() => {
-    const startBackgroundGps = () => {
-      if (backgroundWatchIdRef.current !== null) return;
-      // Try a single get first to wake up GPS
-      navigator.geolocation.getCurrentPosition(
-        () => setGpsAvailable(true),
-        () => setGpsAvailable(false),
-        { enableHighAccuracy: false, timeout: 10000, maximumAge: 10000 }
-      );
-
-      startBackgroundGpsInternal();
+    const initGps = async () => {
+      if (watchId.current !== null) return;
+      await startWatchPosition();
     };
 
     if ('permissions' in navigator) {
       navigator.permissions.query({ name: 'geolocation' as PermissionName }).then(status => {
         setPermissions(prev => ({ ...prev, location: status.state }));
-        
-        if (status.state === 'granted' && !isRunning) {
-          startBackgroundGps();
-        }
-
+        if (status.state === 'granted') initGps();
         status.onchange = () => {
           setPermissions(prev => ({ ...prev, location: status.state }));
-          if (status.state === 'granted' && !isRunning) {
-            startBackgroundGps();
-          } else if (status.state !== 'granted') {
-            if (backgroundWatchIdRef.current !== null) {
-              navigator.geolocation.clearWatch(backgroundWatchIdRef.current);
-              backgroundWatchIdRef.current = null;
-            }
-            setGpsAvailable(false);
-          }
+          if (status.state === 'granted') initGps();
         };
       });
     } else {
-      // Fallback for browsers without permissions API
-      if (!isRunning) startBackgroundGps();
+      initGps();
     }
     
     if ('Notification' in window) {
@@ -369,11 +412,30 @@ export default function App() {
     }
 
     return () => {
-      if (backgroundWatchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(backgroundWatchIdRef.current);
-        backgroundWatchIdRef.current = null;
+      if (watchId.current !== null) {
+        navigator.geolocation.clearWatch(watchId.current);
+        watchId.current = null;
       }
     };
+  }, []);
+
+  // GPS Watchdog: Restart watch if no updates for 15s during activity
+  useEffect(() => {
+    if (!isRunning) return;
+    
+    const watchdogInterval = setInterval(() => {
+      const now = Date.now();
+      if (now - lastUpdateTimestamp.current > 15000) {
+        console.warn("GPS Watchdog: No updates for 15s. Restarting GPS...");
+        if (watchId.current !== null) {
+          navigator.geolocation.clearWatch(watchId.current);
+          watchId.current = null;
+        }
+        startWatchPosition();
+      }
+    }, 5000);
+    
+    return () => clearInterval(watchdogInterval);
   }, [isRunning]);
 
   // Request Wake Lock to keep screen on
@@ -387,7 +449,11 @@ export default function App() {
         });
       }
     } catch (err: any) {
-      console.error(`${err.name}, ${err.message}`);
+      if (err.name === 'NotAllowedError') {
+        console.warn("Wake Lock: Acesso negado pela política de permissões. A tela pode apagar durante o treino.");
+      } else {
+        console.error(`${err.name}, ${err.message}`);
+      }
     }
   };
 
@@ -402,6 +468,7 @@ export default function App() {
   // Handle Vibration and Sound
   const playBeep = useCallback(() => {
     if (!useSound) return;
+    console.log("Tocando Beep de Alerta");
     try {
       if (!audioContext.current) {
         audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -429,20 +496,21 @@ export default function App() {
 
   const startVibration = useCallback(() => {
     if (!isVibratingRef.current) {
+      console.log("Iniciando Alerta de Ritmo (Vibração + Som)");
       setIsVibrating(true);
       isVibratingRef.current = true;
       
-      // Vibrate pattern: 500ms on, 500ms off
+      // Vibrate pattern: 400ms on, 200ms off, 400ms on
       // We use a recursive timeout for better background reliability than setInterval
       const vibrateLoop = () => {
         if (!isVibratingRef.current) return;
         
         if ('vibrate' in navigator) {
-          navigator.vibrate(500);
+          navigator.vibrate([400, 200, 400]);
         }
         playBeep();
         
-        vibrationInterval.current = window.setTimeout(vibrateLoop, 1000);
+        vibrationInterval.current = window.setTimeout(vibrateLoop, 1500);
       };
       
       vibrateLoop();
@@ -461,6 +529,14 @@ export default function App() {
     }
   }, []);
 
+  const activateVibration = () => {
+    // Trigger a small vibration to "unlock" the API and confirm permission
+    if ('vibrate' in navigator) {
+      navigator.vibrate(100);
+      setVibrationAuthorized(true);
+    }
+  };
+
   // Start Tracking
   const startTracking = async () => {
     // Request Notification permission
@@ -473,52 +549,20 @@ export default function App() {
       }
     }
 
-    if (!navigator.geolocation) {
-      setError("Seu navegador não suporta GPS.");
-      return;
-    }
-
-    // Explicitly request GPS if not granted
-    try {
-      await new Promise((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(resolve, (err) => {
-          // Fallback to low accuracy if high accuracy fails
-          if (err.code === 3 || err.code === 2) {
-            navigator.geolocation.getCurrentPosition(resolve, reject, {
-              enableHighAccuracy: false,
-              timeout: 10000,
-              maximumAge: 10000
-            });
-          } else {
-            reject(err);
-          }
-        }, {
-          enableHighAccuracy: true,
-          timeout: 15000,
-          maximumAge: 5000
-        });
-      });
-      setGpsAvailable(true);
-    } catch (err: any) {
-      console.error("Erro ao obter localização inicial:", err);
-      let msg = "Permissão de GPS necessária para monitorar o ritmo.";
-      if (err.code === 1) msg = "Acesso ao GPS foi negado pelo seu navegador.";
-      if (err.code === 2) msg = "Não foi possível obter sua localização (Sinal fraco ou GPS desligado).";
-      if (err.code === 3) msg = "Tempo esgotado ao tentar localizar seu GPS. Tente ir para um local aberto.";
-      setError(msg);
-      return;
-    }
+    // Unlock vibration API with a user gesture
+    activateVibration();
 
     setError(null);
-    
-    // Start 5s countdown
+    setStats(null);
     setCountdown(5);
-    const countdownInterval = window.setInterval(() => {
+
+    if (countdownInterval.current) clearInterval(countdownInterval.current);
+    countdownInterval.current = window.setInterval(() => {
       setCountdown(prev => {
         if (prev === null || prev <= 1) {
-          clearInterval(countdownInterval);
-          // Call initTracking outside of the state updater
-          setTimeout(() => initTracking(), 0);
+          if (countdownInterval.current) clearInterval(countdownInterval.current);
+          countdownInterval.current = null;
+          verifyAndStart();
           return null;
         }
         return prev - 1;
@@ -526,90 +570,116 @@ export default function App() {
     }, 1000);
   };
 
-  const initTracking = async () => {
-    try {
-      setIsRunning(true);
-      isRunningRef.current = true;
-      setIsGracePeriod(true);
-      isGracePeriodRef.current = true;
-      setStats(null);
-      setError(null);
-      
-      // Reset stats
-      startTime.current = Date.now();
-      totalDistance.current = 0;
-      lastPosition.current = null;
-      smoothedSpeed.current = null;
-      
-      // Wake Lock
-      try {
-        await requestWakeLock();
-      } catch (wlErr) {
-        console.warn("Wake Lock falhou (o app pode suspender se a tela apagar):", wlErr);
-        // Don't block the whole app for wake lock, but log it
-      }
+  const verifyAndStart = async () => {
+    // If GPS is already available, start immediately
+    if (gpsAvailable) {
+      initTracking();
+      return;
+    }
 
-      // 5s Grace period for acceleration
-      setTimeout(() => {
-        setIsGracePeriod(false);
-        isGracePeriodRef.current = false;
-      }, 5000);
-
-      // Send start notification
+    // Otherwise, try 3 times
+    setIsVerifyingGps(true);
+    setRetryCount(1);
+    
+    for (let i = 1; i <= 3; i++) {
+      setRetryCount(i);
       try {
-        if (Notification.permission === 'granted') {
-          new Notification("DengosPace", {
-            body: "Monitoramento iniciado. Mantenha o ritmo!",
-            icon: "/favicon.ico",
-            silent: true
+        await new Promise((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, { 
+            enableHighAccuracy: true, 
+            timeout: 10000, 
+            maximumAge: 0 
           });
+        });
+        // Success!
+        setGpsAvailable(true);
+        setIsVerifyingGps(false);
+        initTracking();
+        return;
+      } catch (err) {
+        console.warn(`GPS verification attempt ${i} failed`, err);
+        if (i === 3) {
+          setError("Erro de GPS: Não foi possível obter um sinal estável após 3 tentativas.");
+          setIsVerifyingGps(false);
         }
-      } catch (nErr) {
-        console.error("Erro ao enviar notificação de início:", nErr);
       }
+    }
+  };
 
-      if (!navigator.geolocation) {
-        throw new Error("Seu dispositivo não suporta GPS.");
+  const initTracking = () => {
+    setIsRunning(true);
+    isRunningRef.current = true;
+    
+    // Reset stats
+    totalDistance.current = 0;
+    setDuration(0);
+    startTime.current = Date.now();
+    
+    // Target speed from input
+    targetSpeedRef.current = paceToSpeed(minInput, secInput);
+    useDynamicPaceRef.current = useDynamicPace;
+
+    // Grace period (10s)
+    setIsGracePeriod(true);
+    isGracePeriodRef.current = true;
+    setTimeout(() => {
+      setIsGracePeriod(false);
+      isGracePeriodRef.current = false;
+    }, 10000);
+
+    // Timer
+    if (timerInterval.current) clearInterval(timerInterval.current);
+    timerInterval.current = window.setInterval(() => {
+      setDuration(prev => prev + 1);
+    }, 1000);
+
+    requestWakeLock();
+
+    // Send start notification
+    try {
+      if (Notification.permission === 'granted') {
+        new Notification("DengosPace", {
+          body: "Monitoramento iniciado. Mantenha o ritmo!",
+          icon: "/favicon.ico",
+          silent: true
+        });
       }
-
-      startWatchPosition();
-    } catch (globalErr: any) {
-      console.error("Erro crítico ao iniciar treino:", globalErr);
-      setError(`Erro ao iniciar: ${globalErr.message || "Erro desconhecido"}`);
-      stopTracking();
+    } catch (nErr) {
+      console.error("Erro ao enviar notificação de início:", nErr);
     }
   };
 
   // Stop Tracking
   const stopTracking = useCallback(() => {
-    const endTime = Date.now();
-    const durationMs = startTime.current ? endTime - startTime.current : 0;
-    const durationSec = Math.floor(durationMs / 1000);
-    const distanceKm = totalDistance.current / 1000;
+    console.log("Stopping Tracking...");
     
-    // Calculate average pace
-    let avgPaceStr = "--:--";
-    if (distanceKm > 0.01) { // Only if moved more than 10m
-      const totalMin = durationSec / 60;
-      const paceDecimal = totalMin / distanceKm;
-      const pMin = Math.floor(paceDecimal);
-      const pSec = Math.round((paceDecimal - pMin) * 60);
-      avgPaceStr = formatPace(pMin, pSec);
+    setCountdown(null);
+    setIsVerifyingGps(false);
+    if (countdownInterval.current) {
+      clearInterval(countdownInterval.current);
+      countdownInterval.current = null;
     }
 
-    const finalStats = {
-      distance: Number(distanceKm.toFixed(2)),
-      duration: durationSec,
-      avgPace: avgPaceStr
-    };
+    if (timerInterval.current) {
+      clearInterval(timerInterval.current);
+      timerInterval.current = null;
+    }
 
-    setStats(finalStats);
+    const finalDuration = duration;
+    const finalDistance = totalDistance.current / 1000; // km
+    const avgSpeed = finalDuration > 0 ? (totalDistance.current / finalDuration) : 0;
+    const avgPace = avgSpeed > 0 ? speedToPace(avgSpeed) : { min: 0, sec: 0 };
+
+    setStats({
+      distance: Number(finalDistance.toFixed(2)),
+      duration: finalDuration,
+      avgPace: formatPace(avgPace.min, avgPace.sec)
+    });
+
     setIsRunning(false);
     isRunningRef.current = false;
     setIsGracePeriod(false);
     isGracePeriodRef.current = false;
-    setCountdown(null);
-    setCurrentSpeed(null);
     setIsCompensating(false);
     setAdjustedTargetPace(null);
     stopVibration();
@@ -618,23 +688,21 @@ export default function App() {
     // Send stop notification
     if (Notification.permission === 'granted') {
       new Notification("DengosPace", {
-        body: `Treino finalizado. ${finalStats.distance}km em ${finalStats.avgPace} min/km.`,
+        body: `Treino finalizado. ${finalDistance.toFixed(2)}km em ${formatPace(avgPace.min, avgPace.sec)} min/km.`,
         silent: true,
         tag: 'pace-alert'
       });
     }
-
-    if (watchId.current !== null) {
-      navigator.geolocation.clearWatch(watchId.current);
-      watchId.current = null;
-    }
-  }, [stopVibration, releaseWakeLock]);
+  }, [duration, stopVibration, releaseWakeLock]);
 
   // Cleanup
   useEffect(() => {
     return () => {
       if (watchId.current !== null) {
         navigator.geolocation.clearWatch(watchId.current);
+      }
+      if (countdownInterval.current) {
+        clearInterval(countdownInterval.current);
       }
       if (vibrationInterval.current) {
         clearInterval(vibrationInterval.current);
@@ -679,7 +747,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-md mx-auto p-6 space-y-8 pb-40">
+      <main className="max-w-md mx-auto p-6 space-y-6 pb-40">
         {/* Permission Warnings */}
         {permissions.location === 'denied' && (
           <div className="bg-red-500/20 border border-red-500/50 rounded-2xl p-4 flex gap-3 text-red-200 text-sm">
@@ -688,269 +756,217 @@ export default function App() {
           </div>
         )}
 
-        {/* Pace Input Section - Hidden when running */}
-        {!isRunning && countdown === null && (
-          <section className="space-y-4">
-            <div className="flex justify-between items-center">
-              <div className="flex items-center gap-2 text-neutral-400 text-sm font-medium uppercase tracking-wider">
-                <Timer className="w-4 h-4" />
-                <span>Ritmo Alvo (min/km)</span>
-              </div>
-              <button 
-                onClick={checkGpsManually}
-                disabled={isCheckingGps}
-                className="flex items-center gap-2 hover:bg-white/5 px-2 py-1 rounded-lg transition-colors active:scale-95 disabled:opacity-50"
-              >
-                <div className={`w-2 h-2 rounded-full ${isCheckingGps ? 'bg-blue-500 animate-ping' : gpsAvailable ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
-                <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">
-                  {isCheckingGps ? 'Verificando...' : gpsAvailable ? 'GPS Pronto' : 'Buscando GPS (Toque p/ Forçar)'}
+        {/* GPS Status & Info */}
+        <div className="flex justify-between items-center px-2">
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <div className={`w-2 h-2 rounded-full ${gpsAvailable ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+              <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">
+                {gpsAvailable ? 'GPS Conectado' : 'Buscando GPS...'}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-500/50' : 'bg-blue-500 animate-pulse'}`} />
+              <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">
+                {isOnline ? 'Online' : 'Modo Offline Ativo'}
+              </span>
+            </div>
+          </div>
+          {isRunning && (
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full bg-blue-500 animate-ping" />
+              <span className="text-[10px] font-bold text-blue-500 uppercase tracking-widest">Treino em Curso</span>
+            </div>
+          )}
+        </div>
+
+        {/* Main Dashboard Stats */}
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-neutral-900/50 border border-white/5 rounded-3xl p-6 space-y-1">
+            <div className="text-neutral-500 text-[10px] uppercase font-bold tracking-widest">Distância</div>
+            <div className="text-3xl font-black text-white">
+              {(totalDistance.current / 1000).toFixed(2)} <span className="text-sm text-neutral-500 font-bold uppercase">km</span>
+            </div>
+          </div>
+          <div className="bg-neutral-900/50 border border-white/5 rounded-3xl p-6 space-y-1">
+            <div className="text-neutral-500 text-[10px] uppercase font-bold tracking-widest">Duração</div>
+            <div className="text-3xl font-black text-white">
+              {Math.floor(duration / 60)}:{(duration % 60).toString().padStart(2, '0')}
+            </div>
+          </div>
+        </div>
+
+        {/* Pace Section */}
+        <div className={`border rounded-[40px] p-8 space-y-8 relative overflow-hidden transition-all duration-500 ${
+          isRunning && isVibrating ? 'bg-red-500/20 border-red-500/50' : 'bg-neutral-900 border-white/10'
+        }`}>
+          {/* Background Highlight for Pace status */}
+          {isRunning && currentSpeed !== null && (
+            <div className={`absolute inset-0 opacity-10 transition-colors duration-500 ${
+              isVibrating ? 'bg-red-500' : 'bg-emerald-500'
+            }`} />
+          )}
+
+          <div className="relative z-10 space-y-6">
+            {isRunning && !isGracePeriod && (
+              <div className="text-center">
+                <span className={`text-[10px] font-black uppercase tracking-[0.2em] px-3 py-1 rounded-full ${
+                  isVibrating ? 'bg-red-500 text-white animate-pulse' : 'bg-emerald-500/20 text-emerald-500'
+                }`}>
+                  {isVibrating ? 'Acelere! Abaixo do Ritmo' : 'Ritmo OK'}
                 </span>
-              </button>
-            </div>
-            
-            <div className="bg-neutral-900/50 border border-white/10 rounded-3xl p-8 flex flex-col items-center justify-center gap-4">
-              <div className="flex items-baseline gap-2">
-                <input 
-                  type="number" 
-                  value={minInput}
-                  onChange={(e) => setMinInput(Math.max(0, parseInt(e.target.value) || 0))}
-                  className="w-24 text-6xl font-black text-center bg-transparent border-b-2 border-emerald-500/30 focus:border-emerald-500 outline-none transition-colors"
-                />
-                <span className="text-4xl font-bold text-neutral-600">:</span>
-                <input 
-                  type="number" 
-                  value={secInput}
-                  onChange={(e) => setSecInput(Math.min(59, Math.max(0, parseInt(e.target.value) || 0)))}
-                  className="w-24 text-6xl font-black text-center bg-transparent border-b-2 border-emerald-500/30 focus:border-emerald-500 outline-none transition-colors"
-                />
               </div>
-              <p className="text-neutral-500 text-sm">
-                Equivale a {(targetSpeed * 3.6).toFixed(1)} km/h
-              </p>
+            )}
+            
+            <div className="grid grid-cols-2 gap-4 divide-x divide-white/5">
+              <div className="text-center space-y-1">
+                <div className="text-neutral-500 text-[10px] uppercase font-bold tracking-widest">Velocidade</div>
+                <div className="text-4xl font-black tracking-tighter tabular-nums">
+                  {currentSpeed !== null ? (currentSpeed * 3.6).toFixed(1) : '0.0'}
+                </div>
+                <div className="text-[10px] text-neutral-500 font-bold uppercase tracking-widest">km/h</div>
+              </div>
+              
+              <div className="text-center space-y-1">
+                <div className="text-neutral-500 text-[10px] uppercase font-bold tracking-widest">Ritmo Atual</div>
+                <div className="text-4xl font-black tracking-tighter tabular-nums">
+                  {currentSpeed && currentSpeed > 0.2 ? (
+                    formatPace(speedToPace(currentSpeed).min, speedToPace(currentSpeed).sec)
+                  ) : (
+                    '--:--'
+                  )}
+                </div>
+                <div className="text-[10px] text-neutral-500 font-bold uppercase tracking-widest">min/km</div>
+              </div>
             </div>
-          </section>
+
+            {/* Target Pace Input / Display */}
+            <div className="pt-6 border-t border-white/5 space-y-4">
+              <div className="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-neutral-500">
+                <span>Meta Definida</span>
+                {isRunning && isCompensating && (
+                  <span className="text-blue-500 animate-pulse">Compensando Atraso</span>
+                )}
+              </div>
+              
+              <div className="flex items-center justify-center gap-4">
+                {isRunning ? (
+                  <div className="flex flex-col items-center">
+                    <div className="text-4xl font-black text-emerald-500 tabular-nums">
+                      {adjustedTargetPace ? (
+                        formatPace(adjustedTargetPace.min, adjustedTargetPace.sec)
+                      ) : (
+                        formatPace(minInput, secInput)
+                      )}
+                    </div>
+                    <div className="text-[10px] font-bold text-neutral-600 uppercase tracking-widest mt-1">
+                      Meta: {(targetSpeedRef.current * 3.6).toFixed(1)} km/h
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <input 
+                      type="number" 
+                      value={minInput}
+                      onChange={(e) => setMinInput(Math.max(0, parseInt(e.target.value) || 0))}
+                      className="w-16 text-4xl font-black text-center bg-transparent border-b-2 border-emerald-500/30 focus:border-emerald-500 outline-none transition-colors"
+                    />
+                    <span className="text-2xl font-black text-neutral-700">:</span>
+                    <input 
+                      type="number" 
+                      value={secInput}
+                      onChange={(e) => setSecInput(Math.min(59, Math.max(0, parseInt(e.target.value) || 0)))}
+                      className="w-16 text-4xl font-black text-center bg-transparent border-b-2 border-emerald-500/30 focus:border-emerald-500 outline-none transition-colors"
+                    />
+                  </div>
+                )}
+              </div>
+
+              {!isRunning && (
+                <div className="text-center">
+                  <span className="text-[10px] font-bold text-neutral-600 uppercase tracking-widest">
+                    Equivalente a: {((1 / ((minInput * 60 + secInput) / 3600)) || 0).toFixed(1)} km/h
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Grace Period Indicator */}
+        {isRunning && isGracePeriod && (
+          <div className="bg-blue-500/10 border border-blue-500/30 rounded-2xl p-4 flex items-center gap-3">
+            <div className="w-5 h-5 rounded-full border-2 border-blue-500 border-t-transparent animate-spin shrink-0" />
+            <div className="space-y-0.5">
+              <div className="text-[10px] font-black text-blue-400 uppercase tracking-widest">Período de Aceleração</div>
+              <p className="text-[10px] text-blue-400/70">Aguardando estabilização do ritmo...</p>
+            </div>
+          </div>
         )}
 
-        {/* Countdown UI */}
-        {countdown !== null && (
+        {/* Last Run Summary (Stats) */}
+        {stats && !isRunning && (
           <motion.div 
-            initial={{ scale: 0.5, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            className="flex flex-col items-center justify-center py-12"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-emerald-500/10 border border-emerald-500/30 rounded-3xl p-6 space-y-4"
           >
-            <span className="text-neutral-500 text-sm font-bold uppercase tracking-widest mb-4">Prepare-se</span>
-            <div className="text-9xl font-black text-emerald-500 drop-shadow-[0_0_30px_rgba(16,185,129,0.5)]">
-              {countdown}
+            <div className="flex justify-between items-center">
+              <h3 className="text-xs font-black uppercase tracking-widest text-emerald-500">Último Treino</h3>
+              <button onClick={() => setStats(null)} className="p-1 hover:bg-white/5 rounded-full">
+                <Square className="w-3 h-3 text-neutral-500" />
+              </button>
+            </div>
+            <div className="grid grid-cols-3 gap-4 text-center">
+              <div>
+                <div className="text-[10px] text-neutral-500 font-bold uppercase mb-1">Dist.</div>
+                <div className="text-sm font-black">{stats.distance}km</div>
+              </div>
+              <div>
+                <div className="text-[10px] text-neutral-500 font-bold uppercase mb-1">Tempo</div>
+                <div className="text-sm font-black">{Math.floor(stats.duration / 60)}m{stats.duration % 60}s</div>
+              </div>
+              <div>
+                <div className="text-[10px] text-neutral-500 font-bold uppercase mb-1">Pace</div>
+                <div className="text-sm font-black">{stats.avgPace}</div>
+              </div>
             </div>
           </motion.div>
         )}
-
-        {/* Status Section */}
-        <AnimatePresence mode="wait">
-          {isRunning ? (
-            <motion.section 
-              key="active"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              className="space-y-6"
-            >
-              <div className={`rounded-3xl p-8 border-2 transition-all duration-500 ${
-                isGracePeriod
-                  ? 'bg-blue-500/10 border-blue-500 shadow-[0_0_40px_-10px_rgba(59,130,246,0.3)]'
-                  : isVibrating 
-                    ? 'bg-red-500/10 border-red-500 shadow-[0_0_40px_-10px_rgba(239,68,68,0.3)]' 
-                    : 'bg-emerald-500/10 border-emerald-500 shadow-[0_0_40px_-10px_rgba(16,185,129,0.3)]'
-              }`}>
-                <div className="flex flex-col items-center text-center gap-2">
-                  <span className="text-sm font-bold uppercase tracking-widest opacity-60">
-                    {isGracePeriod ? 'Acelerando...' : isVibrating ? 'Abaixo da Meta' : 'No Ritmo'}
-                  </span>
-                  
-                  <div className="text-8xl font-black tabular-nums">
-                    {currentSpeed !== null 
-                      ? formatPace(speedToPace(currentSpeed).min, speedToPace(currentSpeed).sec)
-                      : '--:--'}
-                  </div>
-                  
-                  <div className="flex items-center gap-4 text-neutral-400 font-medium">
-                    <span>Ritmo Atual</span>
-                    <span className="text-neutral-600">|</span>
-                    <span className={isCompensating ? "text-blue-400" : "text-emerald-500/80"}>
-                      {isCompensating && adjustedTargetPace 
-                        ? `Meta Ajustada: ${formatPace(adjustedTargetPace.min, adjustedTargetPace.sec)}`
-                        : `Meta: ${formatPace(minInput, secInput)}`}
-                    </span>
-                  </div>
-                </div>
-
-                {isVibrating && !isGracePeriod && (
-                  <motion.div 
-                    animate={{ scale: [1, 1.1, 1] }}
-                    transition={{ repeat: Infinity, duration: 0.5 }}
-                    className="mt-6 flex items-center justify-center gap-2 text-red-500 font-bold"
-                  >
-                    <Vibrate className="w-5 h-5" />
-                    <span>ACELERE!</span>
-                  </motion.div>
-                )}
-
-                {isGracePeriod && (
-                  <div className="mt-6 flex flex-col items-center gap-2">
-                    <div className="w-full bg-white/5 h-1.5 rounded-full overflow-hidden">
-                      <motion.div 
-                        initial={{ width: "0%" }}
-                        animate={{ width: "100%" }}
-                        transition={{ duration: 5, ease: "linear" }}
-                        className="h-full bg-blue-500"
-                      />
-                    </div>
-                    <span className="text-[10px] text-blue-400 font-bold uppercase tracking-widest">Período de Aceleração</span>
-                  </div>
-                )}
-              </div>
-
-              <div className="grid grid-cols-3 gap-2">
-                <div className="bg-neutral-900 border border-white/5 rounded-2xl p-3">
-                  <div className="text-neutral-500 text-[10px] uppercase font-bold mb-1">Velocidade</div>
-                  <div className="text-lg font-bold">
-                    {currentSpeed !== null ? (currentSpeed * 3.6).toFixed(1) : '0.0'} <span className="text-[10px] text-neutral-500 font-normal">km/h</span>
-                  </div>
-                </div>
-                <div className="bg-neutral-900 border border-white/5 rounded-2xl p-3">
-                  <div className="text-neutral-500 text-[10px] uppercase font-bold mb-1">Distância</div>
-                  <div className="text-lg font-bold">
-                    {(totalDistance.current / 1000).toFixed(2)} <span className="text-[10px] text-neutral-500 font-normal">km</span>
-                  </div>
-                </div>
-                <div className="bg-neutral-900 border border-white/5 rounded-2xl p-3">
-                  <div className="text-neutral-500 text-[10px] uppercase font-bold mb-1">GPS</div>
-                  <button 
-                    onClick={checkGpsManually}
-                    disabled={isCheckingGps}
-                    className="flex items-center gap-1.5 mt-1 w-full hover:bg-white/5 rounded p-1 transition-colors disabled:opacity-50"
-                  >
-                    <div className={`w-1.5 h-1.5 rounded-full ${isCheckingGps ? 'bg-blue-500 animate-ping' : currentSpeed !== null ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
-                    <span className="text-[10px] font-bold truncate">
-                      {isCheckingGps ? 'Verificando...' : currentSpeed !== null ? 'Sinal OK' : 'Buscando (Toque)'}
-                    </span>
-                  </button>
-                </div>
-              </div>
-            </motion.section>
-          ) : stats ? (
-            <motion.section 
-              key="summary"
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="space-y-6"
-            >
-              <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-3xl p-8 text-center space-y-6">
-                <div className="space-y-1">
-                  <div className="w-12 h-12 bg-emerald-500 rounded-full flex items-center justify-center mx-auto mb-4">
-                    <Activity className="w-6 h-6 text-black" />
-                  </div>
-                  <h2 className="text-2xl font-black uppercase tracking-tight">Resumo do Treino</h2>
-                  <p className="text-neutral-500 text-sm">Bom trabalho! Aqui estão seus resultados.</p>
-                </div>
-
-                <div className="grid grid-cols-3 gap-4 py-4">
-                  <div className="space-y-1">
-                    <div className="text-[10px] text-neutral-500 font-bold uppercase">Distância</div>
-                    <div className="text-xl font-black text-emerald-500">{stats.distance}km</div>
-                  </div>
-                  <div className="space-y-1">
-                    <div className="text-[10px] text-neutral-500 font-bold uppercase">Duração</div>
-                    <div className="text-xl font-black text-emerald-500">
-                      {Math.floor(stats.duration / 60)}m{stats.duration % 60}s
-                    </div>
-                  </div>
-                  <div className="space-y-1">
-                    <div className="text-[10px] text-neutral-500 font-bold uppercase">Pace Médio</div>
-                    <div className="text-xl font-black text-emerald-500">{stats.avgPace}</div>
-                  </div>
-                </div>
-
-                <button 
-                  onClick={() => setStats(null)}
-                  className="text-xs font-bold text-emerald-500/60 hover:text-emerald-500 transition-colors uppercase tracking-widest"
-                >
-                  Fechar Resumo
-                </button>
-              </div>
-            </motion.section>
-          ) : (
-            <motion.section 
-              key="idle"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              className="space-y-6"
-            >
-              <div className="bg-neutral-900/30 border border-white/5 rounded-3xl p-6 space-y-4">
-                <div className="flex gap-4">
-                  <div className="w-10 h-10 rounded-full bg-neutral-800 flex items-center justify-center shrink-0">
-                    <Info className="w-5 h-5 text-emerald-500" />
-                  </div>
-                  <div className="space-y-1">
-                    <h3 className="font-bold">Como funciona?</h3>
-                    <p className="text-sm text-neutral-400 leading-relaxed">
-                      O app vibrará continuamente se você estiver abaixo do ritmo definido. 
-                      O silêncio significa que você está na meta!
-                    </p>
-                  </div>
-                </div>
-                <div className="flex gap-4">
-                  <div className="w-10 h-10 rounded-full bg-neutral-800 flex items-center justify-center shrink-0">
-                    <MapPin className="w-5 h-5 text-blue-500" />
-                  </div>
-                  <div className="space-y-1">
-                    <h3 className="font-bold">Dica de Precisão</h3>
-                    <p className="text-sm text-neutral-400 leading-relaxed">
-                      Para melhores resultados, use o celular em um braçadeira ou bolso firme. 
-                      O GPS funciona melhor em áreas abertas.
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </motion.section>
-          )}
-        </AnimatePresence>
 
         {/* Error Message */}
         {error && (
           <motion.div 
             initial={{ opacity: 0, scale: 0.9 }}
             animate={{ opacity: 1, scale: 1 }}
-            className="bg-red-500/20 border border-red-500/50 rounded-2xl p-4 flex flex-col gap-3 text-red-200 text-sm"
+            className="bg-red-500/20 border border-red-500/50 rounded-2xl p-4 flex gap-3 text-red-200 text-sm"
           >
-            <div className="flex gap-3">
-              <AlertTriangle className="w-5 h-5 shrink-0" />
-              <p>{error}</p>
-            </div>
-            {error.includes("GPS") && (
-              <button 
-                onClick={checkGpsManually}
-                disabled={isCheckingGps}
-                className="bg-red-500/30 hover:bg-red-500/50 py-2 rounded-xl font-bold uppercase tracking-widest text-[10px] transition-colors disabled:opacity-50"
-              >
-                {isCheckingGps ? 'Verificando...' : 'Tentar Novamente'}
-              </button>
-            )}
+            <AlertTriangle className="w-5 h-5 shrink-0" />
+            <p>{error}</p>
           </motion.div>
         )}
 
         {/* Action Button */}
         <div className="fixed bottom-10 left-0 right-0 px-6 max-w-md mx-auto">
           <button
-            onClick={isRunning || countdown !== null ? stopTracking : startTracking}
+            onClick={isRunning || countdown !== null || isVerifyingGps ? stopTracking : startTracking}
             className={`w-full py-6 rounded-full font-black text-xl tracking-widest flex items-center justify-center gap-3 transition-all active:scale-95 shadow-2xl ${
-              isRunning || countdown !== null
+              isRunning || countdown !== null || isVerifyingGps
                 ? 'bg-neutral-800 text-white hover:bg-neutral-700' 
                 : 'bg-emerald-500 text-black hover:bg-emerald-400 shadow-emerald-500/20'
             }`}
           >
-            {isRunning || countdown !== null ? (
+            {isVerifyingGps ? (
+              <>
+                <div className="w-6 h-6 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                CONECTANDO...
+              </>
+            ) : countdown !== null ? (
+              <>
+                <span className="text-3xl animate-ping">{countdown}</span>
+                PREPARE-SE
+              </>
+            ) : isRunning ? (
               <>
                 <Square className="w-6 h-6 fill-current" />
                 PARAR TREINO
