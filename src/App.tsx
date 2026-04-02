@@ -73,6 +73,7 @@ export default function App() {
   const [adjustedTargetPace, setAdjustedTargetPace] = useState<{min: number, sec: number} | null>(null);
   
   // Refs for tracking and state sync in callbacks
+  const backgroundWatchIdRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
   const isGracePeriodRef = useRef(false);
   const isVibratingRef = useRef(false);
@@ -144,37 +145,77 @@ export default function App() {
     if (isCheckingGps) return;
     setIsCheckingGps(true);
     setError(null);
+    
     try {
-      // If we are already running, we should try to restart the watchPosition
-      if (isRunningRef.current && watchId.current !== null) {
+      // 1. Clear all active watches to avoid conflicts
+      if (watchId.current !== null) {
         navigator.geolocation.clearWatch(watchId.current);
         watchId.current = null;
       }
+      if (backgroundWatchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(backgroundWatchIdRef.current);
+        backgroundWatchIdRef.current = null;
+      }
 
-      const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(
-          (p) => resolve(p),
-          (err) => reject(err),
-          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-        );
-      });
+      // 2. Try High Accuracy first
+      try {
+        await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(
+            (p) => resolve(p),
+            (err) => reject(err),
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+          );
+        });
+      } catch (highAccErr: any) {
+        // 3. Fallback to Low Accuracy if High fails (except for permission denied)
+        if (highAccErr.code !== 1) {
+          console.warn("High accuracy failed, trying low accuracy...");
+          await new Promise<GeolocationPosition>((resolve, reject) => {
+            navigator.geolocation.getCurrentPosition(
+              (p) => resolve(p),
+              (err) => reject(err),
+              { enableHighAccuracy: false, timeout: 10000, maximumAge: 5000 }
+            );
+          });
+        } else {
+          throw highAccErr;
+        }
+      }
 
       setGpsAvailable(true);
 
-      // If we were running, restart the watch
+      // 4. Restart the appropriate watch
       if (isRunningRef.current) {
         startWatchPosition();
+      } else {
+        // Re-trigger background watch via effect or manually
+        // For simplicity, we'll let the effect handle it if we just clear the ref
+        // but since we want it NOW, let's call the start function if we had one
+        // Actually, the effect will re-run if we change a dependency, 
+        // but here we can just manually restart it.
+        startBackgroundGpsInternal();
       }
     } catch (err: any) {
       console.error("Manual GPS check failed:", err);
       let msg = "Não foi possível encontrar o sinal de GPS.";
-      if (err.code === 1) msg = "Permissão de GPS negada.";
+      if (err.code === 1) msg = "Permissão de GPS negada. Verifique as configurações do navegador.";
+      if (err.code === 2) msg = "Sinal de GPS indisponível. Verifique se o GPS do aparelho está ligado.";
       if (err.code === 3) msg = "Tempo esgotado. Tente ir para um local aberto.";
       setError(msg);
       setGpsAvailable(false);
     } finally {
       setIsCheckingGps(false);
     }
+  };
+
+  const startBackgroundGpsInternal = () => {
+    if (backgroundWatchIdRef.current !== null || isRunningRef.current) return;
+    
+    backgroundWatchIdRef.current = navigator.geolocation.watchPosition(
+      () => setGpsAvailable(true),
+      () => setGpsAvailable(false),
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
+    );
   };
 
   const startWatchPosition = () => {
@@ -285,10 +326,8 @@ export default function App() {
 
   // Check permissions and start background GPS check
   useEffect(() => {
-    let backgroundWatchId: number | null = null;
-
     const startBackgroundGps = () => {
-      if (backgroundWatchId !== null) return;
+      if (backgroundWatchIdRef.current !== null) return;
       // Try a single get first to wake up GPS
       navigator.geolocation.getCurrentPosition(
         () => setGpsAvailable(true),
@@ -296,11 +335,7 @@ export default function App() {
         { enableHighAccuracy: false, timeout: 10000, maximumAge: 10000 }
       );
 
-      backgroundWatchId = navigator.geolocation.watchPosition(
-        () => setGpsAvailable(true),
-        () => setGpsAvailable(false),
-        { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
-      );
+      startBackgroundGpsInternal();
     };
 
     if ('permissions' in navigator) {
@@ -316,9 +351,9 @@ export default function App() {
           if (status.state === 'granted' && !isRunning) {
             startBackgroundGps();
           } else if (status.state !== 'granted') {
-            if (backgroundWatchId !== null) {
-              navigator.geolocation.clearWatch(backgroundWatchId);
-              backgroundWatchId = null;
+            if (backgroundWatchIdRef.current !== null) {
+              navigator.geolocation.clearWatch(backgroundWatchIdRef.current);
+              backgroundWatchIdRef.current = null;
             }
             setGpsAvailable(false);
           }
@@ -334,8 +369,9 @@ export default function App() {
     }
 
     return () => {
-      if (backgroundWatchId !== null) {
-        navigator.geolocation.clearWatch(backgroundWatchId);
+      if (backgroundWatchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(backgroundWatchIdRef.current);
+        backgroundWatchIdRef.current = null;
       }
     };
   }, [isRunning]);
